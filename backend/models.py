@@ -21,6 +21,25 @@ class CheckDetail(BaseModel):
     severity: Literal["pass", "warning", "fail"] | None = None
 
 
+class ChampionInfo(BaseModel):
+    """Which optimization run/iteration's config is CURRENTLY LIVE in the agent.
+
+    Resolved by fingerprint-matching the live serialized_space to a stored
+    iteration snapshot. ``verified`` is False when no snapshot matched (e.g. the
+    live config was hand-edited outside the optimizer).
+    """
+    verified: bool = False
+    live_accuracy: float | None = None       # 0.0-1.0
+    live_run_id: str | None = None
+    live_iteration: int | None = None
+    live_fingerprint: str | None = None
+    best_accuracy: float | None = None       # best config ever produced across runs
+    best_run_id: str | None = None
+    best_iteration: int | None = None
+    live_is_best: bool | None = None
+    updated_at: str | None = None
+
+
 class ScanResult(BaseModel):
     """IQ scan result for a Genie Agent."""
     space_id: str
@@ -34,6 +53,7 @@ class ScanResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)               # Advisory findings from warning-severity checks
     warning_next_steps: list[str] = Field(default_factory=list)     # Paired with warnings
     scanned_at: str  # ISO datetime string
+    champion: ChampionInfo | None = None     # Which config version is live (cross-run champion)
 
 
 class SpaceListItem(BaseModel):

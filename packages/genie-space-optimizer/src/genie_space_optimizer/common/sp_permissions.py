@@ -28,7 +28,11 @@ def _get_sp_client_id(ws: WorkspaceClient) -> str:
 
 
 def get_sp_principal_aliases(sp_ws: WorkspaceClient) -> set[str]:
-    """Return known principal aliases for the app service principal."""
+    """Return known principal aliases for the app service principal.
+
+    Includes direct identity attributes AND group memberships so that
+    UC effective-grant checks match privileges inherited via groups.
+    """
     aliases: set[str] = set()
     cid = _get_sp_client_id(sp_ws)
     if cid:
@@ -39,8 +43,14 @@ def get_sp_principal_aliases(sp_ws: WorkspaceClient) -> set[str]:
             value = getattr(me, attr, None)
             if value:
                 aliases.add(str(value).lower())
+        # Include group names so grants assigned to a group are recognized
+        for group in getattr(me, "groups", None) or []:
+            group_display = getattr(group, "display", None) or getattr(group, "value", None)
+            if group_display:
+                aliases.add(str(group_display).lower())
     except Exception:
         logger.debug("Could not resolve SP aliases from current_user.me()", exc_info=True)
+    logger.debug("Principal aliases (including groups): %s", aliases)
     return aliases
 
 

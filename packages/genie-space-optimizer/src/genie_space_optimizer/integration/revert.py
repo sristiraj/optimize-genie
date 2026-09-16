@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
 
 from genie_space_optimizer.common.warehouse import (
+    _fqn,
     sql_warehouse_query,
     wh_load_run,
     wh_reconcile_active_runs,
@@ -233,7 +234,7 @@ def _assert_no_active_space_runs(
     """
     safe_space = space_id.replace("'", "''")
     sql = (
-        f"SELECT * FROM {config.catalog}.{config.schema_name}.genie_opt_runs "
+        f"SELECT * FROM {_fqn(config.catalog, config.schema_name, 'genie_opt_runs')} "
         f"WHERE space_id = '{safe_space}' ORDER BY started_at DESC"
     )
     runs_df = sql_warehouse_query(sp_ws, config.warehouse_id, sql)
@@ -503,7 +504,7 @@ def _load_champion_description(
     preserves the live description.
     """
     safe_run = run_id.replace("'", "''")
-    table = f"{catalog}.{schema_name}.genie_opt_artifacts"
+    table = _fqn(catalog, schema_name, "genie_opt_artifacts")
     sql = (
         f"SELECT artifact_json FROM {table} "
         f"WHERE run_id = '{safe_run}' "
@@ -687,7 +688,7 @@ def _load_champion_config(
     error rather than silently reverting to the baseline.
     """
     safe_run = run_id.replace("'", "''")
-    table = f"{catalog}.{schema_name}.genie_opt_iterations"
+    table = _fqn(catalog, schema_name, "genie_opt_iterations")
     sql = (
         f"SELECT observed_config_json, config_json FROM {table} "
         f"WHERE run_id = '{safe_run}' "

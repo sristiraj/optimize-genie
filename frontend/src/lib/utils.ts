@@ -23,7 +23,7 @@ export function getScoreHex(maturity: string | null | undefined): string {
 
 /** Format optimization accuracy for display. */
 export function getOptimizationLabel(accuracy: number | null | undefined): string {
-  if (accuracy != null) return `${Math.round(accuracy * 100)}% benchmark accuracy`
+  if (accuracy != null) return `${Math.round(accuracy * 100)}% GSO benchmark accuracy`
   return "Not yet optimized"
 }
 

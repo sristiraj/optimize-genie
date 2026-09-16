@@ -1,10 +1,10 @@
 /**
- * SpaceDetail - 3-tab detail view for a Genie Agent.
- * Tabs: Score (default) | Optimize | History
+ * SpaceDetail - 4-tab detail view for a Genie Agent.
+ * Tabs: Score (default) | Optimize | History | Load Test
  */
 import { useState, useEffect, useRef, useCallback, useMemo } from "react"
-import { ArrowLeft, Star, BarChart2, Clock, ExternalLink, Rocket, Play, ChevronDown, ChevronRight, Settings, RefreshCw } from "lucide-react"
-import { scanSpace, toggleStar, getSpaceHistory, getSpaceDetail, getActiveRunForSpace } from "@/lib/api"
+import { ArrowLeft, Star, BarChart2, Clock, ExternalLink, Rocket, Play, ChevronDown, ChevronRight, Settings, RefreshCw, Gauge } from "lucide-react"
+import { scanSpace, toggleStar, getSpaceHistory, getSpaceDetail, getActiveRunForSpace, getChampion } from "@/lib/api"
 import { MATURITY_COLORS, getOptimizationLabel } from "@/lib/utils"
 import type { ScanResult, ScoreHistoryPoint, OptimizationEvent } from "@/types"
 import { IQScoreTab } from "./IQScoreTab"
@@ -12,6 +12,7 @@ import { HistoryTab } from "./HistoryTab"
 import { useAnalysis } from "@/hooks/useAnalysis"
 import { SpaceOverview } from "@/components/SpaceOverview"
 import { AutoOptimizeTab } from "@/components/auto-optimize/AutoOptimizeTab"
+import { LoadTestTab } from "./LoadTestTab"
 import type { SpaceTab } from "@/lib/navigation"
 import { createScanCoordinator } from "@/lib/scan-coordinator"
 
@@ -77,13 +78,39 @@ export function SpaceDetail({ spaceId, displayName, spaceUrl, activeTab, runId, 
         })
         .catch((e) => console.error("Failed to load space detail:", e))
         .finally(() => setIsLoadingScan(false))
+      // Load the cross-run champion pointer (which config version is live) and
+      // merge it in — the persisted scan result doesn't carry it.
+      getChampion(spaceId)
+        .then((champion) => {
+          if (champion) {
+            setScanResult((prev) => (prev ? { ...prev, champion } : prev))
+          }
+        })
+        .catch(() => {})
     }
   }, [spaceId, handleFetchSpace])
 
+  // Poll active-run status so the "optimization in progress" banner clears on
+  // its own once the job finishes (a one-shot fetch would leave it stale until
+  // reload). Polls every 10s only while a run is active, then stops.
   useEffect(() => {
-    getActiveRunForSpace(spaceId)
-      .then((res) => setActiveOptRunId(res.hasActiveRun ? res.activeRunId : null))
-      .catch(() => {})
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const check = async () => {
+      try {
+        const res = await getActiveRunForSpace(spaceId)
+        if (cancelled) return
+        setActiveOptRunId(res.hasActiveRun ? res.activeRunId : null)
+        if (res.hasActiveRun) timer = setTimeout(check, 10000)
+      } catch {
+        if (!cancelled) timer = setTimeout(check, 15000)
+      }
+    }
+    check()
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
   }, [spaceId])
 
   const scanCoordinator = useMemo(
@@ -154,6 +181,7 @@ export function SpaceDetail({ spaceId, displayName, spaceUrl, activeTab, runId, 
     { id: "score", label: "Score", icon: <BarChart2 className="w-4 h-4" /> },
     { id: "optimize", label: "Optimize", icon: <Rocket className="w-4 h-4" /> },
     { id: "history", label: "History", icon: <Clock className="w-4 h-4" /> },
+    { id: "loadtest", label: "Load Test", icon: <Gauge className="w-4 h-4" /> },
   ]
 
   // Determine contextual action(s) based on scan results
@@ -334,6 +362,9 @@ export function SpaceDetail({ spaceId, displayName, spaceUrl, activeTab, runId, 
 
         {activeTab === "history" && (
           <HistoryTab history={history} optimizationEvents={optimizationEvents} isLoading={isLoadingHistory} />
+        )}
+        {activeTab === "loadtest" && (
+          <LoadTestTab spaceId={spaceId} />
         )}
       </div>
 

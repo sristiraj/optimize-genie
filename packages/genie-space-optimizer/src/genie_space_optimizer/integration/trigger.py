@@ -16,6 +16,8 @@ if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
 
 from genie_space_optimizer.common.warehouse import (
+    _fqn,
+    _quote_id,
     sql_warehouse_execute,
     sql_warehouse_query,
     wh_create_run,
@@ -32,6 +34,74 @@ _ACTIVE_RUN_STATUSES = frozenset({"QUEUED", "IN_PROGRESS"})
 
 _SUPPORTED_APPLY_MODES = {"genie_config", "uc_artifact", "both"}
 _SUPPORTED_BENCHMARK_POLICIES = {"review_only", "repair_allowed"}
+
+
+def _grant_job_run_as_schema_access(
+    ws: "WorkspaceClient",
+    warehouse_id: str,
+    job_id: int | str,
+    catalog: str,
+    schema: str,
+    calling_user: str = "",
+) -> None:
+    """Look up the job's run_as identity and grant it schema access.
+
+    When the deployer is a service principal different from the OBO user,
+    the job cluster runs as the SP but the OBO user created the schema.
+    This pre-grants the SP so job tasks don't hit SCHEMA_NOT_FOUND.
+    Best-effort: failures are logged but never re-raised.
+    """
+    try:
+        job = ws.jobs.get(job_id=int(job_id))
+        settings = getattr(job, "settings", None)
+        run_as = getattr(settings, "run_as", None) if settings else None
+
+        # service_principal_name from JobRunAs is the SP application_id (used in GRANT)
+        principal = (
+            (getattr(run_as, "service_principal_name", None) if run_as else None)
+            or (getattr(run_as, "user_name", None) if run_as else None)
+            # run_as_user_name on the Job object is the resolved display identity
+            or getattr(job, "run_as_user_name", None)
+            or ""
+        )
+        if not principal:
+            logger.debug("Job %s run_as has no resolvable principal", job_id)
+            return
+        logger.info("Discovered job %s run_as identity: %s", job_id, principal)
+
+        # Skip if the job runs as the same user who is issuing grants
+        if calling_user and str(principal).lower() == calling_user.lower():
+            logger.debug(
+                "Job run_as %s matches calling user — schema grant is implicit (owner)", principal
+            )
+            return
+
+        schema_fqn = f"{_quote_id(catalog)}.{_quote_id(schema)}"
+        for stmt in [
+            f"GRANT USE SCHEMA ON SCHEMA {schema_fqn} TO `{principal}`",
+            f"GRANT CREATE TABLE ON SCHEMA {schema_fqn} TO `{principal}`",
+            f"GRANT SELECT ON SCHEMA {schema_fqn} TO `{principal}`",
+            f"GRANT MODIFY ON SCHEMA {schema_fqn} TO `{principal}`",
+        ]:
+            try:
+                sql_warehouse_execute(ws, warehouse_id, stmt)
+            except Exception as exc:
+                msg = str(exc)
+                if "already exists" in msg.lower() or "ALREADY_EXISTS" in msg:
+                    pass
+                else:
+                    logger.warning("Could not grant job identity '%s': %s", stmt[:80], exc)
+
+        logger.info(
+            "Granted job run_as %s access to schema %s.%s", principal, catalog, schema
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not look up job %s run_as to grant schema access: %s. "
+            "If the job fails with SCHEMA_NOT_FOUND, manually run: "
+            "GRANT USE SCHEMA ON SCHEMA %s.%s TO `<job-run-as-identity>`",
+            job_id, exc, catalog, schema,
+        )
 
 
 def _capture_config_snapshot(
@@ -165,16 +235,33 @@ def trigger_optimization(
         )
 
     wh_ensure_optimization_tables(
-        sp_ws,
+        ws,
         config.warehouse_id,
         config.catalog,
         config.schema_name,
+        sp_ws=sp_ws,
     )
+
+    # Discover the job's actual run_as identity and grant it schema access.
+    # Needed when sp_ws == ws (no separate SP creds locally) but the job was
+    # deployed by a service principal — those cases would hit SCHEMA_NOT_FOUND
+    # because wh_grant_sp_schema_access only grants sp_ws.current_user.me(),
+    # which equals the OBO user when there are no env-var SP credentials.
+    if config.job_id:
+        _calling_user = caller_email  # already resolved above
+        _grant_job_run_as_schema_access(
+            ws,
+            config.warehouse_id,
+            config.job_id,
+            config.catalog,
+            config.schema_name,
+            calling_user=_calling_user,
+        )
 
     runs_df = sql_warehouse_query(
         ws,
         config.warehouse_id,
-        f"SELECT * FROM {config.catalog}.{config.schema_name}.genie_opt_runs "
+        f"SELECT * FROM {_fqn(config.catalog, config.schema_name, 'genie_opt_runs')} "
         f"WHERE space_id = '{space_id}' ORDER BY started_at DESC",
     )
 
@@ -186,7 +273,7 @@ def trigger_optimization(
             runs_df = sql_warehouse_query(
                 ws,
                 config.warehouse_id,
-                f"SELECT * FROM {config.catalog}.{config.schema_name}.genie_opt_runs "
+                f"SELECT * FROM {_fqn(config.catalog, config.schema_name, 'genie_opt_runs')} "
                 f"WHERE space_id = '{space_id}' ORDER BY started_at DESC",
             )
 
@@ -302,7 +389,7 @@ def trigger_optimization(
             sql_warehouse_execute(
                 ws,
                 config.warehouse_id,
-                f"UPDATE {config.catalog}.{config.schema_name}.genie_opt_runs "
+                f"UPDATE {_fqn(config.catalog, config.schema_name, 'genie_opt_runs')} "
                 f"SET status = 'FAILED', "
                 f"convergence_reason = 'job_submission_error: {str(exc)[:500]}', "
                 f"updated_at = current_timestamp() "
@@ -316,7 +403,7 @@ def trigger_optimization(
     # first warehouse UPDATE fails.  Retry the idempotent handoff with the app
     # service principal; never misclassify a live job as a submission failure.
     handoff_sql = (
-        f"UPDATE {config.catalog}.{config.schema_name}.genie_opt_runs "
+        f"UPDATE {_fqn(config.catalog, config.schema_name, 'genie_opt_runs')} "
         f"SET status = 'IN_PROGRESS', job_run_id = '{job_run_id}', "
         f"job_id = '{job_id}', "
         f"updated_at = current_timestamp() "

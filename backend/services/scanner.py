@@ -52,6 +52,166 @@ _GSO_TERMINAL = {"CONVERGED", "STALLED", "MAX_ITERATIONS", "APPLIED"}
 _uc_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="uc-enrich")
 
 
+# ── Live-config fingerprinting (cross-run champion) ────────────────────────────
+
+def _inner_serialized_space(cfg) -> dict:
+    """Return the inner serialized_space dict from any wrapper shape."""
+    import json as _json
+    if isinstance(cfg, str):
+        try:
+            cfg = _json.loads(cfg)
+        except Exception:
+            return {}
+    if not isinstance(cfg, dict):
+        return {}
+    for key in ("serialized_space", "_parsed_space"):
+        v = cfg.get(key)
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, str):
+            try:
+                return _json.loads(v)
+            except Exception:
+                pass
+    return cfg
+
+
+def config_fingerprint(cfg) -> str:
+    """Stable identity of a Genie config's serialized_space.
+
+    Excludes the ``benchmarks`` block (regenerated/mutated every run) and any
+    runtime ``_``-prefixed keys, so the fingerprint identifies the *agent config*
+    itself — independent of which benchmark set it was scored against. Two runs
+    that left the space in the same configured state produce the same hash.
+    """
+    import hashlib
+    import json as _json
+    ss = _inner_serialized_space(cfg)
+    stripped = {k: v for k, v in ss.items() if not k.startswith("_") and k != "benchmarks"}
+    return hashlib.sha256(
+        _json.dumps(stripped, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _pct_to_fraction(value) -> float | None:
+    """GSO stores accuracy as 0-100; normalize to 0.0-1.0."""
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v / 100.0 if v > 1.0 else v
+
+
+async def _resolve_live_champion(space_id: str) -> dict | None:
+    """Match the live config fingerprint to a stored iteration → the cross-run champion.
+
+    Fetches the live config via the SAME path that produced the stored snapshots
+    (``fetch_space_config``) so fingerprints are comparable — the backend's
+    ``get_serialized_space`` returns a different shape, and the scanner further
+    mutates it with UC enrichment, so neither can be fingerprinted for a match.
+
+    Returns a dict with the LIVE config's accuracy (if a snapshot matched), its
+    fingerprint, and the best config ever produced across runs, and records the
+    champion pointer in Delta. ``None`` when GSO storage isn't configured.
+    """
+    from backend.services.request_config import get_request_config
+    rc = get_request_config()
+    catalog = rc.gso_catalog or os.environ.get("GSO_CATALOG", "")
+    schema = os.environ.get("GSO_SCHEMA", "genie_space_optimizer")
+    wh_id = rc.warehouse_id or os.environ.get("GSO_WAREHOUSE_ID") or os.environ.get("SQL_WAREHOUSE_ID", "")
+    if not (catalog and wh_id):
+        return None
+
+    def _work():
+        from genie_space_optimizer.common.warehouse import sql_warehouse_query
+        from genie_space_optimizer.common.genie_client import fetch_space_config
+        from backend.services.auth import get_service_principal_client
+        from backend.services import delta_store
+
+        def _q(s: str) -> str:
+            return f"`{s.replace('`', '``')}`"
+
+        ws = get_service_principal_client()
+        # Fingerprint the live config via the GSO fetch path (parity with snapshots).
+        try:
+            live_fp = config_fingerprint(fetch_space_config(ws, space_id))
+        except Exception as e:
+            logger.warning("could not fetch live config for fingerprint (%s): %s", space_id, e)
+            return None
+        # Candidate configs that could be live: champions, baselines, and accepted
+        # (non-rolled-back) iterations across the space's runs.
+        df = sql_warehouse_query(
+            ws, wh_id,
+            f"SELECT i.run_id, i.iteration, i.overall_accuracy, i.is_champion, "
+            f"       i.observed_config_json, i.config_json "
+            f"FROM {_q(catalog)}.{_q(schema)}.`genie_opt_iterations` i "
+            f"JOIN {_q(catalog)}.{_q(schema)}.`genie_opt_runs` r ON i.run_id = r.run_id "
+            f"WHERE r.space_id = '{space_id}' AND i.eval_scope = 'full' "
+            f"  AND (i.is_champion = true OR i.iteration = 0 OR i.rolled_back = false) "
+            f"ORDER BY r.started_at DESC LIMIT 200"
+        )
+        if df.empty:
+            return None
+        rows = df.to_dict(orient="records")
+
+        # Best config ever produced across candidates.
+        best = None
+        for row in rows:
+            acc = _pct_to_fraction(row.get("overall_accuracy"))
+            if acc is None:
+                continue
+            if best is None or acc > best["accuracy"]:
+                best = {"accuracy": acc, "run_id": row.get("run_id"),
+                        "iteration": int(row.get("iteration") or 0)}
+
+        # The iteration whose config matches the LIVE fingerprint.
+        matched = None
+        for row in rows:
+            for col in ("observed_config_json", "config_json"):
+                cfg = row.get(col)
+                if cfg and config_fingerprint(cfg) == live_fp:
+                    matched = row
+                    break
+            if matched:
+                break
+
+        result = {
+            "live_fingerprint": live_fp,
+            "best_accuracy": best["accuracy"] if best else None,
+            "best_run_id": best["run_id"] if best else None,
+            "best_iteration": best["iteration"] if best else None,
+            "matched": matched is not None,
+        }
+        if matched:
+            live_acc = _pct_to_fraction(matched.get("overall_accuracy"))
+            result.update({
+                "accuracy": live_acc,
+                "run_id": matched.get("run_id"),
+                "iteration": int(matched.get("iteration") or 0),
+            })
+            delta_store.set_space_champion(
+                space_id,
+                run_id=matched.get("run_id"),
+                iteration=int(matched.get("iteration") or 0),
+                accuracy=live_acc,
+                config_fingerprint=live_fp,
+                source="live_verified",
+                best_run_id=result["best_run_id"],
+                best_iteration=result["best_iteration"],
+                best_accuracy=result["best_accuracy"],
+            )
+        return result
+
+    loop = asyncio.get_event_loop()
+    try:
+        return await loop.run_in_executor(None, _work)
+    except Exception as e:
+        logger.warning("Live-champion resolution failed for %s: %s", space_id, e)
+        return None
+
+
 def _parse_identifier(identifier: str) -> tuple[str, str, str]:
     """Parse a 3-part table identifier into (catalog, schema, table)."""
     parts = identifier.replace("`", "").split(".")
@@ -187,18 +347,22 @@ async def scan_space(space_id: str, user_token: Optional[str] = None) -> dict:
             runs = await gso_lakebase.load_gso_runs_for_space(space_id)
             # Delta table fallback when Lakebase synced tables are empty
             if not runs:
-                catalog = os.environ.get("GSO_CATALOG", "")
+                from backend.services.request_config import get_request_config
+                rc = get_request_config()
+                catalog = rc.gso_catalog or os.environ.get("GSO_CATALOG", "")
                 schema = os.environ.get("GSO_SCHEMA", "genie_space_optimizer")
-                wh_id = os.environ.get("GSO_WAREHOUSE_ID") or os.environ.get("SQL_WAREHOUSE_ID", "")
+                wh_id = rc.warehouse_id or os.environ.get("GSO_WAREHOUSE_ID") or os.environ.get("SQL_WAREHOUSE_ID", "")
                 if catalog and wh_id:
                     try:
                         from genie_space_optimizer.common.warehouse import sql_warehouse_query
                         from backend.services.auth import get_service_principal_client
+                        def _q(s: str) -> str:
+                            return f"`{s.replace('`', '``')}`"
                         ws = get_service_principal_client()
                         df = sql_warehouse_query(
                             ws, wh_id,
                             f"SELECT run_id, space_id, status, best_accuracy, completed_at, started_at "
-                            f"FROM {catalog}.{schema}.genie_opt_runs "
+                            f"FROM {_q(catalog)}.{_q(schema)}.`genie_opt_runs` "
                             f"WHERE space_id = '{space_id}' ORDER BY started_at DESC"
                         )
                         if not df.empty:
@@ -214,25 +378,66 @@ async def scan_space(space_id: str, user_token: Optional[str] = None) -> dict:
         _fetch_opt_run(), _fetch_gso_runs()
     )
 
-    # Use the best accuracy from either source
-    for gso_run in gso_runs:  # already sorted most recent first
-        status = str(gso_run.get("status", "")).upper()
-        best_acc = gso_run.get("best_accuracy")
-        if status in _GSO_TERMINAL and best_acc is not None:
-            acc = float(best_acc)
-            # GSO stores accuracy as percentage (0-100); normalize to 0.0-1.0
-            if acc > 1.0:
-                acc = acc / 100.0
-            gso_as_opt = {
-                "accuracy": acc,
-                "created_at": gso_run.get("completed_at") or gso_run.get("started_at"),
-            }
-            if optimization_run is None or gso_as_opt["accuracy"] > optimization_run.get("accuracy", 0):
-                optimization_run = gso_as_opt
-            break  # only consider most recent terminal GSO run
+    # Resolve the accuracy of the config CURRENTLY LIVE in the agent by matching
+    # its fingerprint to a stored iteration snapshot (the cross-run champion).
+    # This is authoritative — it reports what's actually deployed, not merely the
+    # most recent run — and records the champion pointer for the space.
+    champion_info: dict | None = None
+    try:
+        champion_info = await _resolve_live_champion(space_id)
+    except Exception as e:
+        logger.warning("champion resolution error for %s: %s", space_id, e)
+    live_fp = champion_info.get("live_fingerprint") if champion_info else None
+
+    if champion_info and champion_info.get("matched") and champion_info.get("accuracy") is not None:
+        # Live config matched a snapshot → use its measured accuracy.
+        optimization_run = {"accuracy": champion_info["accuracy"], "created_at": None}
+    else:
+        # Fallback 1: a previously-recorded champion pointer whose fingerprint
+        # still matches the live config.
+        pointer = None
+        try:
+            from backend.services import delta_store
+            loop = asyncio.get_event_loop()
+            pointer = await loop.run_in_executor(None, delta_store.get_space_champion, space_id)
+        except Exception:
+            pointer = None
+        if pointer and live_fp and pointer.get("config_fingerprint") == live_fp and pointer.get("accuracy") is not None:
+            optimization_run = {"accuracy": float(pointer["accuracy"]), "created_at": None}
+        else:
+            # Fallback 2: legacy heuristic — most recent terminal run's best_accuracy.
+            for gso_run in gso_runs:  # already sorted most recent first
+                status = str(gso_run.get("status", "")).upper()
+                best_acc = gso_run.get("best_accuracy")
+                if status in _GSO_TERMINAL and best_acc is not None:
+                    acc = _pct_to_fraction(best_acc)
+                    gso_as_opt = {
+                        "accuracy": acc,
+                        "created_at": gso_run.get("completed_at") or gso_run.get("started_at"),
+                    }
+                    if optimization_run is None or gso_as_opt["accuracy"] > optimization_run.get("accuracy", 0):
+                        optimization_run = gso_as_opt
+                    break
 
     scan_result = calculate_score(space_data, optimization_run=optimization_run)
     scan_result["space_id"] = space_id
+
+    # Surface cross-run champion context so the UI can show "live vs best available".
+    if champion_info:
+        best_acc = champion_info.get("best_accuracy")
+        live_acc = champion_info.get("accuracy") if champion_info.get("matched") else None
+        scan_result["champion"] = {
+            "verified": bool(champion_info.get("matched")),
+            "live_accuracy": live_acc,
+            "live_run_id": champion_info.get("run_id"),
+            "live_iteration": champion_info.get("iteration"),
+            "best_accuracy": best_acc,
+            "best_run_id": champion_info.get("best_run_id"),
+            "best_iteration": champion_info.get("best_iteration"),
+            "live_is_best": (
+                live_acc is not None and best_acc is not None and live_acc >= best_acc
+            ),
+        }
 
     # Persist to Lakebase
     try:

@@ -177,12 +177,62 @@ async def trigger_scan(space_id: SpaceId) -> ScanResult:
             warnings=scan_data.get("warnings", []),
             warning_next_steps=scan_data.get("warning_next_steps", []),
             scanned_at=scan_data["scanned_at"],
+            champion=scan_data.get("champion"),
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.exception(f"Scan failed for {space_id}: {e}")
         raise HTTPException(status_code=500, detail="Scan failed")
+
+
+@router.get("/spaces/{space_id}/champion")
+async def get_champion(space_id: SpaceId) -> dict:
+    """Return the cross-run champion pointer — which run/iteration config is LIVE.
+
+    Read from the ``genie_space_champion`` Delta table (maintained by the scanner).
+    Returns ``{"champion": null}`` when no champion has been recorded yet.
+    """
+    try:
+        from backend.services import delta_store
+        loop = asyncio.get_event_loop()
+        row = await loop.run_in_executor(None, delta_store.get_space_champion, space_id)
+        if not row:
+            return {"champion": None}
+
+        def _f(v):
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        def _i(v):
+            try:
+                return int(float(v)) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        live_acc = _f(row.get("accuracy"))
+        best_acc = _f(row.get("best_accuracy"))
+        return {
+            "champion": {
+                "verified": str(row.get("source") or "") == "live_verified",
+                "live_accuracy": live_acc,
+                "live_run_id": row.get("run_id"),
+                "live_iteration": _i(row.get("iteration")),
+                "live_fingerprint": row.get("config_fingerprint"),
+                "best_accuracy": best_acc,
+                "best_run_id": row.get("best_run_id"),
+                "best_iteration": _i(row.get("best_iteration")),
+                "live_is_best": (
+                    live_acc is not None and best_acc is not None and live_acc >= best_acc
+                ),
+                "updated_at": str(row.get("updated_at")) if row.get("updated_at") is not None else None,
+            }
+        }
+    except Exception as e:
+        logger.warning(f"Failed to get champion for {space_id}: {e}")
+        return {"champion": None}
 
 
 @router.get("/spaces/{space_id}/history")

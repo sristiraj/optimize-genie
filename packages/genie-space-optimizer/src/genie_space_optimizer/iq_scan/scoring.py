@@ -470,19 +470,27 @@ def calculate_score(space_data: dict, optimization_run: dict | None = None) -> d
     join_specs = instructions.get("join_specs", [])
     join_count = len(join_specs)
     table_count = len(tables)
-    passed = total_sources > 0 and (table_count <= 1 or join_count > 0)
+    passed = total_sources > 0
     detail = f"{join_count} join spec(s) for {table_count} table(s)"
-    severity = "pass" if passed else "fail"
-    if passed and table_count > 1 and join_count < table_count - 1:
+    severity = "pass"
+    if table_count > 1 and join_count == 0:
+        # Tables may be intentionally independent (different question domains).
+        # Flag as a warning rather than a hard fail so valid siloed-table agents
+        # are not blocked from "Ready to Optimize" maturity.
+        severity = "warning"
+        detail += " — add join specs if tables share keys"
+    elif table_count > 1 and join_count < table_count - 1:
         severity = "warning"
         detail += " — relationship coverage may be incomplete"
     _check(checks, "Join specifications", passed, detail=detail, severity=severity)
-    if not passed and table_count > 1:
-        findings.append("No join specifications for multi-table agent")
-        next_steps.append("Add join specifications to help Genie correctly join your tables")
-    elif severity == "warning":
+    if severity == "warning" and table_count > 1:
         warnings.append(detail)
-        warning_next_steps.append("Add join specs for the remaining key relationships between tables")
+        if join_count == 0:
+            warning_next_steps.append(
+                "If your tables share keys, add join specifications to help Genie join them correctly"
+            )
+        else:
+            warning_next_steps.append("Add join specs for the remaining key relationships between tables")
 
     # 6. Data source count 1-12 (Gap 10: adjusted from 1-10)
     passed = 1 <= total_sources <= 12
@@ -656,10 +664,13 @@ def calculate_score(space_data: dict, optimization_run: dict | None = None) -> d
     # 12. Accuracy ≥ 85%
     accuracy = optimization_run.get("accuracy", 0) if optimization_run else 0
     passed = has_run and accuracy >= 0.85
-    detail = f"Accuracy: {accuracy:.0%}" if has_run else None
+    detail = (
+        f"GSO benchmark accuracy: {accuracy:.0%} "
+        f"(best-ever across iterations; note: native Genie eval uses different questions)"
+    ) if has_run else None
     _check(checks, "Optimization accuracy ≥ 85%", passed, detail=detail)
     if has_run and not passed:
-        findings.append(f"Optimization accuracy is {accuracy:.0%} — target ≥ 85%")
+        findings.append(f"GSO benchmark accuracy is {accuracy:.0%} — target ≥ 85%")
         next_steps.append("Re-run the optimization workflow to improve benchmark accuracy to 85%+")
 
     score = sum(1 for c in checks if c["passed"])

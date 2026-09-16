@@ -332,6 +332,19 @@ except Exception as exc:
 
 # COMMAND ----------
 
+# Atomic-run safety: capture the exact pre-run config so a crash can restore it.
+# A failed/crashed run must leave the live agent EXACTLY as it was before the run
+# started — never a half-optimized or un-scored candidate config. Normal
+# completion is unaffected (the loop leaves its champion live); this only fires
+# on an unhandled exception, where the last-applied candidate would otherwise be
+# stranded on the live space.
+try:
+    from genie_space_optimizer.common.genie_client import fetch_space_config as _fetch_prerun
+    _prerun_config = _fetch_prerun(w, space_id)
+except Exception as _prerun_exc:
+    _prerun_config = None
+    _log("Could not capture pre-run config for crash-restore", error=str(_prerun_exc))
+
 try:
     _banner("Running unified native-only optimization loop")
     loop_out = run_unified_optimization_loop(
@@ -388,6 +401,23 @@ except Exception as exc:
         error_message=str(exc),
         next_source="genie_opt_stages",
     )
+    # Atomic-run rollback: restore the pre-run config so this failed run is a
+    # no-op on the live agent. The loop mutates the space in place, so an
+    # unhandled exception can leave an un-scored candidate deployed; reverting to
+    # the pre-run baseline prevents that (and the config drift it caused across
+    # prior FAILED runs). Best-effort — a restore failure must not mask the
+    # original error.
+    if _prerun_config:
+        try:
+            from genie_space_optimizer.common.genie_client import patch_space_config as _patch_prerun
+            _patch_prerun(w, space_id, _prerun_config)
+            _log("Restored pre-run config after failure (atomic-run rollback)", space_id=space_id)
+        except Exception as _restore_exc:
+            _log(
+                "Pre-run config restore FAILED — live agent may retain a partial config",
+                space_id=space_id,
+                error=str(_restore_exc),
+            )
     raise
 
 from genie_space_optimizer.optimization.wide_schema_prompt import (

@@ -54,7 +54,10 @@ logger = logging.getLogger(__name__)
 def ensure_optimization_tables(spark: SparkSession, catalog: str, schema: str) -> None:
     """Create all optimization Delta tables if they don't exist (idempotent)."""
     try:
-        spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
+        import re as _re
+        def _qid(s: str) -> str:
+            return s if _re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', s) else f'`{s}`'
+        spark.sql(f"CREATE SCHEMA IF NOT EXISTS {_qid(catalog)}.{_qid(schema)}")
     except Exception as exc:
         exc_str = str(exc)
         if "PERMISSION_DENIED" in exc_str or "ACCESS_DENIED" in exc_str:
@@ -67,7 +70,7 @@ def ensure_optimization_tables(spark: SparkSession, catalog: str, schema: str) -
             raise
 
     for name, ddl in _ALL_DDL.items():
-        resolved = ddl.replace("{catalog}", catalog).replace("{schema}", schema)
+        resolved = ddl.replace("{catalog}", _qid(catalog)).replace("{schema}", _qid(schema))
         try:
             spark.sql(resolved)
             logger.info("  [OK] %s.%s.%s", catalog, schema, name)

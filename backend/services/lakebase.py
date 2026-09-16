@@ -6,6 +6,7 @@ in-memory fallback. Watch tables are prefixed `watch_` to keep ownership clear.
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -16,7 +17,21 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# In-memory fallback store (used when Lakebase is unavailable)
+
+def _run_delta_in_ctx(loop, fn, *args):
+    """Run a blocking delta_store call on the executor, preserving contextvars.
+
+    ``run_in_executor`` dispatches to a thread-pool thread that does NOT inherit
+    the current context, so ``get_request_config()`` (per-request GSO catalog /
+    warehouse from the setup-wizard headers) would read the empty default there
+    and the Delta write/read would silently target the wrong location. Copying
+    the context and running the call inside it preserves the request config (and
+    OBO token) on the worker thread. Returns the executor Future.
+    """
+    ctx = contextvars.copy_context()
+    return loop.run_in_executor(None, lambda: ctx.run(fn, *args))
+
+# In-memory fallback store (used when both Lakebase and Delta store are unavailable).
 _memory_store: dict = {
     "scans": {},      # space_id -> latest ScanResult dict
     "history": {},    # space_id -> list of ScanResult dicts (ordered by timestamp)
@@ -156,40 +171,10 @@ async def _ensure_schema():
     try:
         async with _pool.acquire() as conn:
             await conn.execute("CREATE SCHEMA IF NOT EXISTS genie")
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS genie.scan_results (
-                    id          SERIAL PRIMARY KEY,
-                    space_id    VARCHAR(64) NOT NULL,
-                    score       INTEGER     NOT NULL CHECK (score >= 0 AND score <= 100),
-                    maturity    VARCHAR(32) NOT NULL,
-                    breakdown   JSONB       NOT NULL DEFAULT '{}',
-                    findings    JSONB       NOT NULL DEFAULT '[]',
-                    next_steps  JSONB       NOT NULL DEFAULT '[]',
-                    scanned_at  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-                    UNIQUE (space_id, scanned_at)
-                )
-            """)
-            await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_scan_results_space_id ON genie.scan_results(space_id)"
-            )
-            await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_scan_results_scanned_at ON genie.scan_results(scanned_at DESC)"
-            )
-            await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_scan_results_score ON genie.scan_results(score)"
-            )
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS genie.starred_spaces (
-                    space_id   VARCHAR(64) PRIMARY KEY,
-                    starred_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS genie.seen_spaces (
-                    space_id   VARCHAR(64) PRIMARY KEY,
-                    first_seen TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
-                )
-            """)
+            # NOTE: IQ scan history, stars, and seen-spaces are persisted in DELTA
+            # (see delta_store.py), not Lakebase. Their former Postgres tables
+            # (genie.scan_results / starred_spaces / seen_spaces) are intentionally
+            # no longer created here.
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS genie.optimization_runs (
                     id              SERIAL PRIMARY KEY,
@@ -282,7 +267,7 @@ async def _ensure_schema():
                 "CREATE INDEX IF NOT EXISTS idx_watch_rollup_day ON genie.watch_daily_usage_rollup(day DESC)"
             )
         _lakebase_available = True
-        logger.info("Lakebase schema ready (5 workbench tables + 5 watch tables)")
+        logger.info("Lakebase schema ready (2 optimization-run tables + 5 watch tables; IQ scan/stars/seen are in Delta)")
     except Exception as e:
         logger.warning(f"Failed to ensure Lakebase schema: {e}. Falling back to in-memory storage.")
         _lakebase_available = False
@@ -416,217 +401,130 @@ async def close_pool():
         _pool = None
 
 
+#
+# Workbench state (IQ scan history, stars, seen spaces) is persisted in DELTA,
+# not Lakebase. Delta (`delta_store`) is the durable store; the in-process
+# ``_memory_store`` is a hot cache that serves reads within a running instance
+# and is warmed from Delta on a cache miss (e.g. after a restart). Lakebase
+# Postgres is intentionally NOT used for these — see delta_store.py.
+#
+
 async def save_scan_result(space_id: str, scan_result: dict) -> None:
-    """Save a scan result to Lakebase (or in-memory fallback)."""
+    """Persist a scan result to Delta (durable) and the in-memory cache (hot)."""
+    from backend.services import delta_store
     scan_result["scanned_at"] = scan_result.get("scanned_at", datetime.utcnow().isoformat())
 
-    if not _lakebase_available or _pool is None:
-        _memory_store["scans"][space_id] = scan_result
-        history = _memory_store["history"].setdefault(space_id, [])
-        history.append(scan_result)
-        # Keep last 30 entries
-        _memory_store["history"][space_id] = history[-30:]
-        _memory_store["seen"].add(space_id)
-        return
+    # Hot path: update the cache immediately so the current instance reads it back
+    # without a warehouse round-trip.
+    _memory_store["scans"][space_id] = scan_result
+    history = _memory_store["history"].setdefault(space_id, [])
+    history.append(scan_result)
+    _memory_store["history"][space_id] = history[-30:]
+    _memory_store["seen"].add(space_id)
 
-    import json
-    async with _pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO genie.scan_results (space_id, score, maturity, breakdown, findings, next_steps, scanned_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (space_id, scanned_at) DO UPDATE SET
-                score = EXCLUDED.score,
-                maturity = EXCLUDED.maturity,
-                breakdown = EXCLUDED.breakdown,
-                findings = EXCLUDED.findings,
-                next_steps = EXCLUDED.next_steps
-        """,
-            space_id,
-            scan_result["score"],
-            scan_result["maturity"],
-            json.dumps({
-                "optimization_accuracy": scan_result.get("optimization_accuracy"),
-                "checks": scan_result.get("checks", []),
-                "warnings": scan_result.get("warnings", []),
-                "warning_next_steps": scan_result.get("warning_next_steps", []),
-            }),
-            json.dumps(scan_result.get("findings", [])),
-            json.dumps(scan_result.get("next_steps", [])),
-            datetime.fromisoformat(scan_result["scanned_at"]),
-        )
-        await conn.execute(
-            "INSERT INTO genie.seen_spaces (space_id) VALUES ($1) ON CONFLICT DO NOTHING",
-            space_id,
-        )
-
-
-def _build_score_dict(row) -> dict:
-    """Build a score dict from a scan_results DB row."""
-    import json
-    extra = json.loads(row["breakdown"])
-    return {
-        "score": row["score"],
-        "total": 12,
-        "maturity": row["maturity"],
-        "optimization_accuracy": extra.get("optimization_accuracy"),
-        "checks": extra.get("checks", []),
-        "findings": json.loads(row["findings"]),
-        "next_steps": json.loads(row["next_steps"]),
-        "warnings": extra.get("warnings", []),
-        "warning_next_steps": extra.get("warning_next_steps", []),
-        "scanned_at": row["scanned_at"].isoformat(),
-    }
+    # Durable path: AWAIT the Delta write so the scan is persisted (or its failure
+    # logged) before this returns — no data-loss window if the process dies right
+    # after a scan. delta_store swallows/logs its own errors and no-ops when
+    # GSO_CATALOG / warehouse are unset, so this never raises.
+    loop = asyncio.get_event_loop()
+    await _run_delta_in_ctx(loop, delta_store.save_scan_result, space_id, scan_result)
 
 
 async def get_latest_score(space_id: str) -> Optional[dict]:
-    """Get the latest scan result for a space."""
-    if not _lakebase_available or _pool is None:
-        return _memory_store["scans"].get(space_id)
-
-    async with _pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT score, maturity, breakdown, findings, next_steps, scanned_at
-            FROM genie.scan_results
-            WHERE space_id = $1
-            ORDER BY scanned_at DESC
-            LIMIT 1
-        """, space_id)
-        if not row:
-            return None
-        return _build_score_dict(row)
+    """Get the latest scan result for a space (cache first, then Delta)."""
+    cached = _memory_store["scans"].get(space_id)
+    if cached:
+        return cached
+    from backend.services import delta_store
+    loop = asyncio.get_event_loop()
+    result = await _run_delta_in_ctx(loop, delta_store.get_latest_score, space_id)
+    if result:
+        _memory_store["scans"][space_id] = result
+    return result
 
 
 async def get_latest_scores_batch(space_ids: list[str]) -> dict[str, dict]:
-    """Get the latest scan result for multiple spaces in a single query."""
+    """Get the latest scan result for multiple spaces (cache first, then Delta)."""
     if not space_ids:
         return {}
-
-    if not _lakebase_available or _pool is None:
-        return {
-            sid: _memory_store["scans"][sid]
-            for sid in space_ids
-            if sid in _memory_store["scans"]
-        }
-
-    async with _pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT DISTINCT ON (space_id)
-                space_id, score, maturity, breakdown, findings, next_steps, scanned_at
-            FROM genie.scan_results
-            WHERE space_id = ANY($1)
-            ORDER BY space_id, scanned_at DESC
-        """, space_ids)
-        return {row["space_id"]: _build_score_dict(row) for row in rows}
+    cached = {sid: _memory_store["scans"][sid] for sid in space_ids if sid in _memory_store["scans"]}
+    missing = [sid for sid in space_ids if sid not in cached]
+    if missing:
+        from backend.services import delta_store
+        loop = asyncio.get_event_loop()
+        delta_results = await _run_delta_in_ctx(loop, delta_store.get_latest_scores_batch, missing)
+        _memory_store["scans"].update(delta_results)
+        cached.update(delta_results)
+    return cached
 
 
 async def get_score_history(space_id: str, days: int = 30) -> list[dict]:
-    """Get score history for a space over the last N days."""
-    if not _lakebase_available or _pool is None:
-        return _memory_store["history"].get(space_id, [])
+    """Get score history for a space (cache first, then Delta).
 
-    import json
-    async with _pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT score, maturity, breakdown, scanned_at
-            FROM genie.scan_results
-            WHERE space_id = $1
-              AND scanned_at >= NOW() - $2 * INTERVAL '1 day'
-            ORDER BY scanned_at ASC
-        """, space_id, days)
-        results = []
-        for r in rows:
-            extra = json.loads(r["breakdown"]) if r["breakdown"] else {}
-            results.append({
-                "score": r["score"],
-                "maturity": r["maturity"],
-                "optimization_accuracy": extra.get("optimization_accuracy"),
-                "scanned_at": r["scanned_at"].isoformat(),
-            })
-        return results
+    ``days`` is accepted for API compatibility; the Delta store returns the most
+    recent 30 scans for the space regardless of the window.
+    """
+    cached = _memory_store["history"].get(space_id)
+    if cached:
+        return cached
+    from backend.services import delta_store
+    loop = asyncio.get_event_loop()
+    return await _run_delta_in_ctx(loop, delta_store.get_space_history, space_id)
 
 
 async def star_space(space_id: str, starred: bool) -> None:
-    """Star or unstar a space."""
-    if not _lakebase_available or _pool is None:
-        if starred:
-            _memory_store["stars"].add(space_id)
-        else:
-            _memory_store["stars"].discard(space_id)
-        return
-
-    async with _pool.acquire() as conn:
-        if starred:
-            await conn.execute(
-                "INSERT INTO genie.starred_spaces (space_id) VALUES ($1) ON CONFLICT DO NOTHING",
-                space_id,
-            )
-        else:
-            await conn.execute(
-                "DELETE FROM genie.starred_spaces WHERE space_id = $1",
-                space_id,
-            )
+    """Star or unstar a space (Delta durable, cache hot)."""
+    from backend.services import delta_store
+    if starred:
+        _memory_store["stars"].add(space_id)
+    else:
+        _memory_store["stars"].discard(space_id)
+    # Await the Delta write so a deliberate user action is durably persisted.
+    loop = asyncio.get_event_loop()
+    await _run_delta_in_ctx(loop, delta_store.star_space, space_id, starred)
 
 
 async def get_starred_spaces() -> list[str]:
-    """Get all starred space IDs."""
-    await _maybe_retry_schema()
-    if not _lakebase_available or _pool is None:
+    """Get all starred space IDs (cache first, then Delta)."""
+    if _memory_store["stars"]:
         return list(_memory_store["stars"])
-
-    async with _pool.acquire() as conn:
-        rows = await conn.fetch("SELECT space_id FROM genie.starred_spaces")
-        return [r["space_id"] for r in rows]
+    from backend.services import delta_store
+    loop = asyncio.get_event_loop()
+    starred = await _run_delta_in_ctx(loop, delta_store.get_starred_spaces)
+    _memory_store["stars"] = set(starred)
+    return starred
 
 
 async def is_space_starred(space_id: str) -> bool:
-    """Check if a single space is starred (O(1) vs fetching all)."""
-    if not _lakebase_available or _pool is None:
+    """Check if a single space is starred (cache first, then Delta)."""
+    if _memory_store["stars"]:
         return space_id in _memory_store["stars"]
-
-    async with _pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT 1 FROM genie.starred_spaces WHERE space_id = $1", space_id
-        )
-        return row is not None
+    from backend.services import delta_store
+    loop = asyncio.get_event_loop()
+    return await _run_delta_in_ctx(loop, delta_store.is_space_starred, space_id)
 
 
 async def record_space_seen(space_id: str) -> None:
-    """Record that a space has been seen."""
-    if not _lakebase_available or _pool is None:
-        _memory_store["seen"].add(space_id)
-        return
+    """Record that a space has been seen.
 
-    async with _pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO genie.seen_spaces (space_id) VALUES ($1) ON CONFLICT DO NOTHING",
-            space_id,
-        )
+    High-frequency, cosmetic signal — intentionally kept fire-and-forget so
+    routine space listing/navigation is not blocked on a warehouse round-trip.
+    The cache reflects it immediately; the Delta write catches up in the
+    background.
+    """
+    from backend.services import delta_store
+    _memory_store["seen"].add(space_id)
+    loop = asyncio.get_event_loop()
+    asyncio.ensure_future(_run_delta_in_ctx(loop, delta_store.record_seen, space_id))
 
 
 async def get_all_scan_summaries() -> list[dict]:
-    """Get latest scan summary for all scanned spaces."""
-    await _maybe_retry_schema()
-    if not _lakebase_available or _pool is None:
+    """Get latest scan summary for all scanned spaces (cache first, then Delta)."""
+    if _memory_store["scans"]:
         return list(_memory_store["scans"].values())
-
-    import json
-    async with _pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT DISTINCT ON (space_id)
-                space_id, score, maturity, findings, scanned_at
-            FROM genie.scan_results
-            ORDER BY space_id, scanned_at DESC
-        """)
-        return [
-            {
-                "space_id": r["space_id"],
-                "score": r["score"],
-                "maturity": r["maturity"],
-                "findings": json.loads(r["findings"]),
-                "scanned_at": r["scanned_at"].isoformat(),
-            }
-            for r in rows
-        ]
+    from backend.services import delta_store
+    loop = asyncio.get_event_loop()
+    return await _run_delta_in_ctx(loop, delta_store.get_all_scanned)
 
 
 async def save_optimization_run(space_id: str, benchmark_total: int, benchmark_correct: int) -> None:

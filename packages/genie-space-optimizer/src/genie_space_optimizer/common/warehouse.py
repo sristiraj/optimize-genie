@@ -18,6 +18,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _quote_id(identifier: str) -> str:
+    """Backtick-quote a SQL identifier if it contains characters that require quoting."""
+    if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', identifier):
+        return identifier
+    return f'`{identifier}`'
+
+
+def _fqn(catalog: str, schema: str, table: str) -> str:
+    return f"{_quote_id(catalog)}.{_quote_id(schema)}.{table}"
+
+
 _DEFAULT_RE = re.compile(
     r"\bDEFAULT\s+(?:'[^']*'|[A-Za-z0-9_\-.+]+)",
     re.IGNORECASE,
@@ -163,7 +175,7 @@ def _wh_verify_required_run_columns(
     catalog: str,
     schema: str,
 ) -> None:
-    fqn = f"{catalog}.{schema}.genie_opt_runs"
+    fqn = _fqn(catalog, schema, "genie_opt_runs")
     try:
         present = _wh_describe_columns(ws, warehouse_id, fqn)
     except Exception as exc:
@@ -180,29 +192,88 @@ def _wh_verify_required_run_columns(
         )
 
 
+def wh_grant_sp_schema_access(
+    ws: WorkspaceClient,
+    sp_ws: "WorkspaceClient",
+    warehouse_id: str,
+    catalog: str,
+    schema: str,
+) -> None:
+    """Grant the service principal the minimum privileges it needs on the GSO schema.
+
+    The schema is created by the OBO user (who owns it), so the SP needs explicit
+    grants before its job tasks can read/write the optimization tables.  Best-effort:
+    failures are logged but never re-raised so a missing GRANT doesn't abort the
+    trigger flow.
+    """
+    try:
+        me = sp_ws.current_user.me()
+        sp_id = str(
+            getattr(me, "application_id", None)
+            or getattr(me, "user_name", None)
+            or ""
+        ).strip()
+        if not sp_id:
+            logger.warning("Cannot resolve SP identity for schema grants")
+            return
+        schema_fqn = f"{_quote_id(catalog)}.{_quote_id(schema)}"
+        for stmt in [
+            f"GRANT USE SCHEMA ON SCHEMA {schema_fqn} TO `{sp_id}`",
+            f"GRANT CREATE TABLE ON SCHEMA {schema_fqn} TO `{sp_id}`",
+            f"GRANT SELECT ON SCHEMA {schema_fqn} TO `{sp_id}`",
+            f"GRANT MODIFY ON SCHEMA {schema_fqn} TO `{sp_id}`",
+        ]:
+            try:
+                sql_warehouse_execute(ws, warehouse_id, stmt)
+            except Exception as exc:
+                msg = str(exc)
+                if "already exists" in msg.lower() or "ALREADY_EXISTS" in msg:
+                    pass  # grant already in place
+                else:
+                    logger.warning("Could not issue '%s': %s", stmt[:80], exc)
+        logger.info(
+            "Granted SP %s access to schema %s.%s",
+            sp_id, catalog, schema,
+        )
+    except Exception as exc:
+        logger.warning(
+            "SP schema grant failed for %s.%s — "
+            "job tasks may fail with SCHEMA_NOT_FOUND. "
+            "Run manually: GRANT USE SCHEMA ON SCHEMA %s.%s TO `<sp-application-id>`",
+            catalog, schema, catalog, schema,
+        )
+        logger.debug("SP grant error detail", exc_info=True)
+
+
 def wh_ensure_optimization_tables(
     ws: WorkspaceClient,
     warehouse_id: str,
     catalog: str,
     schema: str,
+    sp_ws: "WorkspaceClient | None" = None,
 ) -> None:
     """Create and migrate GSO Delta state tables via SQL Warehouse.
 
     The Databricks App trigger path is warehouse-first because Spark Connect can
     lose credentials in Apps. Keep this path in lockstep with the Spark
     bootstrapper so newly added columns exist before ``wh_create_run`` inserts.
+
+    When ``sp_ws`` is provided, the SP is also granted USE SCHEMA / table
+    privileges so the job tasks (running as SP) can access the schema.
     """
     from genie_space_optimizer.optimization.ddl import (
         ADDITIVE_COLUMN_MIGRATIONS,
         _ALL_DDL,
     )
 
+    schema_created = False
     try:
         sql_warehouse_execute(
             ws,
             warehouse_id,
-            f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}",
+            f"CREATE SCHEMA IF NOT EXISTS {_quote_id(catalog)}.{_quote_id(schema)}",
         )
+        schema_created = True
     except Exception as exc:
         msg = str(exc)
         if "PERMISSION_DENIED" in msg or "ACCESS_DENIED" in msg:
@@ -215,8 +286,14 @@ def wh_ensure_optimization_tables(
         else:
             raise
 
+    # Grant SP access whenever we created the schema (or attempted to create
+    # it — covers the case where it already existed and the SP hasn't been
+    # granted access yet from a prior session).
+    if sp_ws is not None:
+        wh_grant_sp_schema_access(ws, sp_ws, warehouse_id, catalog, schema)
+
     for name, ddl in _ALL_DDL.items():
-        resolved = ddl.replace("{catalog}", catalog).replace("{schema}", schema)
+        resolved = ddl.replace("{catalog}", _quote_id(catalog)).replace("{schema}", _quote_id(schema))
         try:
             sql_warehouse_execute(ws, warehouse_id, resolved)
             logger.info("Ensured GSO table %s.%s.%s via SQL warehouse", catalog, schema, name)
@@ -238,7 +315,7 @@ def wh_ensure_optimization_tables(
                 raise
 
     for table, col, col_def in ADDITIVE_COLUMN_MIGRATIONS:
-        fqn = f"{catalog}.{schema}.{table}"
+        fqn = _fqn(catalog, schema, table)
         try:
             existing = _wh_describe_columns(ws, warehouse_id, fqn)
         except Exception:
@@ -297,7 +374,7 @@ def wh_create_run(
     # surviving MLflow tracing self-resolves a deterministic experiment path in
     # ``preflight_persist_benchmark_corpus`` (no pointer column needed).
     sql = (
-        f"INSERT INTO {catalog}.{schema}.genie_opt_runs "
+        f"INSERT INTO {_fqn(catalog, schema, 'genie_opt_runs')} "
         f"(run_id, space_id, domain, catalog, uc_schema, status, started_at, "
         f"max_iterations, levers, apply_mode, updated_at, "
         f"triggered_by, config_snapshot, llm_model, benchmark_policy, "
@@ -322,7 +399,7 @@ def wh_load_run(
     df = sql_warehouse_query(
         ws,
         warehouse_id,
-        f"SELECT * FROM {catalog}.{schema_name}.genie_opt_runs "
+        f"SELECT * FROM {_fqn(catalog, schema_name, 'genie_opt_runs')} "
         f"WHERE run_id = '{run_id}'",
     )
     if df.empty:
@@ -383,7 +460,7 @@ def wh_reconcile_active_runs(
                     )
                     sql_warehouse_execute(
                         ws, warehouse_id,
-                        f"UPDATE {catalog}.{schema_name}.genie_opt_runs "
+                        f"UPDATE {_fqn(catalog, schema_name, 'genie_opt_runs')} "
                         f"SET status = 'FAILED', "
                         f"convergence_reason = "
                         f"'job_{life_cycle.lower()}_without_state_update{suffix}', "

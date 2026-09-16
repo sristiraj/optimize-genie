@@ -167,9 +167,17 @@ def _native_df(df: pd.DataFrame) -> pd.DataFrame:
     return df.astype(object).where(df.notna(), None)
 
 
+def _quote_id(identifier: str) -> str:
+    """Backtick-quote a SQL identifier if it contains characters that require quoting."""
+    import re
+    if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', identifier):
+        return identifier
+    return f'`{identifier}`'
+
+
 def _fqn(catalog: str, schema: str, table: str) -> str:
     """Build a fully-qualified Delta table name."""
-    return f"{catalog}.{schema}.{table}"
+    return f"{_quote_id(catalog)}.{_quote_id(schema)}.{table}"
 
 
 def read_table(

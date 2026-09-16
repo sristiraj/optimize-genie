@@ -4,15 +4,17 @@
  */
 import { useCallback, useEffect, useState, Component } from "react"
 import type { ReactNode, ErrorInfo } from "react"
-import { LayoutGrid, BarChart2, BookOpen } from "lucide-react"
+import { LayoutGrid, BarChart2, BookOpen, LogOut } from "lucide-react"
 import { ThemeToggle } from "@/components/ThemeToggle"
 import { useTheme } from "@/hooks/useTheme"
 import { SpaceList } from "@/pages/SpaceList"
 import { SpaceDetail } from "@/pages/SpaceDetail"
 import { AdminDashboard } from "@/pages/AdminDashboard"
 import { HowItWorks } from "@/pages/HowItWorks"
+import { SetupPage } from "@/pages/SetupPage"
 import { CreateAgentChat } from "@/components/CreateAgentChat"
 import { getSpaceDetail } from "@/lib/api"
+import { isConfigured, clearConfig } from "@/lib/config"
 import {
   LIST_ROUTE,
   buildAppRouteUrl,
@@ -63,6 +65,16 @@ function stringField(value: unknown): string | undefined {
 
 export default function App() {
   useTheme()
+  const [configured, setConfigured] = useState<boolean>(isConfigured)
+
+  if (!configured) {
+    return <SetupPage onComplete={() => setConfigured(true)} />
+  }
+
+  return <AppShell onLogout={() => setConfigured(false)} />
+}
+
+function AppShell({ onLogout }: { onLogout: () => void }) {
   const [route, setRoute] = useState<AppRoute>(initialRoute)
   const [detailState, setDetailState] = useState<DetailState | null>(null)
   const [detailError, setDetailError] = useState<DetailError | null>(null)
@@ -210,7 +222,17 @@ export default function App() {
             </button>
           </nav>
 
-          <ThemeToggle />
+          <div className="flex items-center gap-1">
+            <ThemeToggle />
+            <button
+              onClick={() => { clearConfig(); onLogout() }}
+              title="Disconnect from Databricks"
+              className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-sm font-medium transition-colors text-muted hover:text-secondary hover:bg-surface-secondary"
+            >
+              <LogOut className="w-4 h-4" />
+              <span className="hidden sm:inline">Disconnect</span>
+            </button>
+          </div>
         </div>
         <div className="header-accent-line" />
       </header>

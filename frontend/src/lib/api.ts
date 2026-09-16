@@ -2,6 +2,8 @@
  * API client for communicating with the Genie Workbench backend.
  */
 
+import { getConfig } from "./config"
+import type { LoadTestResult, LoadTestStepSummary } from "@/types"
 import type {
   AppSettings,
   LLMModelInfo,
@@ -9,6 +11,7 @@ import type {
   SpaceDetailResponse,
   SpaceListItem,
   ScanResult,
+  ChampionInfo,
   SpaceHistory,
   AdminDashboardStats,
   LeaderboardEntry,
@@ -108,6 +111,24 @@ export function extractDetailMessage(detail: unknown, fallback: string): string 
 }
 
 /**
+ * Build the extra request headers from the setup-wizard config stored in
+ * localStorage.  Returns an empty object when no config is present so the
+ * app keeps working for deployments that rely on the Databricks Apps
+ * platform-injected token (the headers are additive overrides).
+ */
+function getConfigHeaders(): Record<string, string> {
+  const config = getConfig()
+  if (!config) return {}
+  const headers: Record<string, string> = {}
+  if (config.token) headers["x-forwarded-access-token"] = config.token
+  if (config.host) headers["x-databricks-host"] = config.host
+  if (config.warehouseId) headers["x-gso-warehouse-id"] = config.warehouseId
+  if (config.gsoCatalog) headers["x-gso-catalog"] = config.gsoCatalog
+  if (config.llmModel) headers["x-llm-model"] = config.llmModel
+  return headers
+}
+
+/**
  * Fetch with timeout support.
  */
 async function fetchWithTimeout<T>(
@@ -121,6 +142,10 @@ async function fetchWithTimeout<T>(
   try {
     const response = await fetch(url, {
       ...options,
+      headers: {
+        ...getConfigHeaders(),
+        ...(options.headers as Record<string, string> | undefined),
+      },
       signal: controller.signal,
     })
 
@@ -223,6 +248,15 @@ export async function scanSpace(spaceId: string): Promise<ScanResult> {
     { method: "POST", headers: { "Content-Type": "application/json" } },
     LONG_TIMEOUT
   )
+}
+
+export async function getChampion(spaceId: string): Promise<ChampionInfo | null> {
+  const res = await fetchWithTimeout<{ champion: ChampionInfo | null }>(
+    `${API_BASE}/spaces/${spaceId}/champion`,
+    {},
+    DEFAULT_TIMEOUT
+  )
+  return res.champion
 }
 
 export async function getSpaceHistory(spaceId: string, days = 30): Promise<SpaceHistory> {
@@ -358,7 +392,10 @@ export function streamAgentChat(
 
   fetch(`${API_BASE}/create/agent/chat`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      ...getConfigHeaders(),
+      "Content-Type": "application/json",
+    },
     body: JSON.stringify(body),
     signal: abortController.signal,
   })
@@ -498,7 +535,7 @@ export async function revertAutoOptimizeRun(
   return fetchWithTimeout<{ status: string; runId: string; message: string }>(
     `${API_BASE}/auto-optimize/runs/${runId}/revert?${query.toString()}`,
     { method: "POST", headers: { "Content-Type": "application/json" } },
-    DEFAULT_TIMEOUT
+    LONG_TIMEOUT   // revert PATCHes the live config (like apply) — can exceed 30s
   )
 }
 
@@ -621,6 +658,91 @@ export async function getAutoOptimizePublishRecord(runId: string): Promise<GSOPu
   } catch {
     return null
   }
+}
+
+// Load test SSE streaming
+export interface LoadTestRampConfig {
+  startUsers: number
+  maxUsers: number
+  step: number
+  question: string | null
+}
+
+export interface LoadTestTiming {
+  startedAt: string
+  finishedAt: string
+  durationMs: number
+}
+
+export interface LoadTestCallbacks {
+  onStart: (levels: number[], totalRequests: number, startedAt: string) => void
+  onStepStart: (stepIndex: number, concurrentUsers: number, totalLevels: number) => void
+  onProgress: (stepIndex: number, concurrentUsers: number, completed: number, total: number, result: LoadTestResult) => void
+  onStepSummary: (summary: LoadTestStepSummary) => void
+  onDone: (steps: LoadTestStepSummary[], timing: LoadTestTiming) => void
+  onError: (message: string) => void
+}
+
+export function streamLoadTest(
+  spaceId: string,
+  config: LoadTestRampConfig,
+  callbacks: LoadTestCallbacks,
+): () => void {
+  const abortController = new AbortController()
+
+  fetch(`${API_BASE}/spaces/${spaceId}/load-test`, {
+    method: "POST",
+    headers: { ...getConfigHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({
+      start_users: config.startUsers,
+      max_users: config.maxUsers,
+      step: config.step,
+      question: config.question,
+    }),
+    signal: abortController.signal,
+  }).then(async (response) => {
+    if (!response.ok) throw new ApiError("Load test request failed", response.status)
+    const reader = response.body?.getReader()
+    if (!reader) throw new Error("No response body")
+    const decoder = new TextDecoder()
+    let buffer = ""
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const chunks = buffer.split("\n\n")
+      buffer = chunks.pop() || ""
+
+      for (const chunk of chunks) {
+        const lines = chunk.split("\n")
+        let eventType = ""
+        let dataStr = ""
+        for (const line of lines) {
+          if (line.startsWith("event: ")) eventType = line.slice(7)
+          else if (line.startsWith("data: ")) dataStr = line.slice(6)
+        }
+        if (!eventType || !dataStr) continue
+        try {
+          const data = JSON.parse(dataStr)
+          switch (eventType) {
+            case "start": callbacks.onStart(data.levels ?? [], data.total_requests ?? 0, data.started_at ?? ""); break
+            case "step_start": callbacks.onStepStart(data.step_index, data.concurrent_users, data.total_levels); break
+            case "progress": callbacks.onProgress(data.step_index, data.concurrent_users, data.completed, data.total, data.result); break
+            case "step_summary": callbacks.onStepSummary(data); break
+            case "done": callbacks.onDone(data.steps ?? [], { startedAt: data.started_at ?? "", finishedAt: data.finished_at ?? "", durationMs: data.duration_ms ?? 0 }); break
+            case "error": callbacks.onError(data.message ?? "Unknown error"); break
+          }
+        } catch { /* ignore parse errors */ }
+      }
+    }
+  }).catch((err) => {
+    if (err instanceof Error && err.name !== "AbortError") {
+      callbacks.onError(err.message)
+    }
+  })
+
+  return () => abortController.abort()
 }
 
 export { ApiError }

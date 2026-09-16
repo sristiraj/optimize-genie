@@ -65,12 +65,15 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from backend.services.auth import is_running_on_databricks_apps, set_obo_user_token, clear_obo_user_token
+from backend.services.request_config import RequestConfig, set_request_config
 from backend.routers.analysis import router as analysis_router
 from backend.routers.spaces import router as spaces_router
 from backend.routers.admin import router as admin_router
 from backend.routers.auth import router as auth_router
 from backend.routers.create import router as create_router
 from backend.routers.auto_optimize import router as auto_optimize_router
+from backend.routers.load_test import router as load_test_router
+from backend.routers.setup import router as setup_router
 from backend.watch.routers import (
     watch_admin_router,
     watch_cost_router,
@@ -104,8 +107,19 @@ class OBOAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next) -> Response:
         if request.url.path.startswith("/api/"):
             token = request.headers.get("x-forwarded-access-token", "")
+            host_override = request.headers.get("x-databricks-host", "")
+            warehouse_override = request.headers.get("x-gso-warehouse-id", "")
+            catalog_override = request.headers.get("x-gso-catalog", "")
+            llm_override = request.headers.get("x-llm-model", "")
+            if host_override or warehouse_override or catalog_override or llm_override:
+                set_request_config(RequestConfig(
+                    host=host_override,
+                    warehouse_id=warehouse_override,
+                    gso_catalog=catalog_override,
+                    llm_model=llm_override,
+                ))
             if token:
-                set_obo_user_token(token)
+                set_obo_user_token(token, host=host_override)
                 logger.info("OBO: using user token for %s", request.url.path)
             else:
                 logger.info("OBO: no x-forwarded-access-token, using SP for %s", request.url.path)
@@ -209,12 +223,14 @@ async def shutdown():
 
 
 # Mount all routers
+app.include_router(setup_router)
 app.include_router(analysis_router)
 app.include_router(spaces_router)
 app.include_router(admin_router)
 app.include_router(auth_router)
 app.include_router(create_router)
 app.include_router(auto_optimize_router)
+app.include_router(load_test_router)
 
 # GenieWatch (observability) — all routes under /api/watch/*
 app.include_router(watch_spaces_router)

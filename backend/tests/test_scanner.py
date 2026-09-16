@@ -283,11 +283,15 @@ class TestJoinSpecs:
         check = _check_by_label(calculate_score(full_space_data), "Join specifications")
         assert check["passed"] is True
 
-    def test_absent_multi_table_generates_finding(self):
+    def test_absent_multi_table_generates_warning(self):
+        """Multi-table with no joins is a warning (passes check) not a hard finding."""
         tables = [{"name": "t1", "columns": []}, {"name": "t2", "columns": []}]
         data = {"data_sources": {"tables": tables}, "instructions": {}, "benchmarks": {}}
         result = calculate_score(data)
-        assert "No join specifications for multi-table agent" in result["findings"]
+        check = _check_by_label(result, "Join specifications")
+        assert check["passed"] is True
+        assert check["severity"] == "warning"
+        assert any("join specs" in w.lower() for w in result["warnings"])
 
     def test_absent_single_table_no_finding(self):
         tables = [{"name": "t1", "columns": []}]
@@ -344,6 +348,7 @@ class TestJoinSpecs:
         assert check["detail"] == "0 join spec(s) for 0 table(s)"
 
     def test_metric_views_do_not_hide_missing_table_joins(self):
+        """Metric views don't count as tables for join requirements; 2 tables + no joins = warning."""
         data = {
             "data_sources": {
                 "tables": [
@@ -357,8 +362,10 @@ class TestJoinSpecs:
         }
         result = calculate_score(data)
         check = _check_by_label(result, "Join specifications")
-        assert check["passed"] is False
-        assert "No join specifications for multi-table agent" in result["findings"]
+        # 2 tables + no joins is a warning (passes check) not a hard fail
+        assert check["passed"] is True
+        assert check["severity"] == "warning"
+        assert any("join specs" in w.lower() for w in result["warnings"])
 
     def test_metric_views_do_not_inflate_join_coverage_requirement(self):
         data = {

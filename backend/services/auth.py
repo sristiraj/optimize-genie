@@ -33,7 +33,7 @@ def is_running_on_databricks_apps() -> bool:
     return os.environ.get("DATABRICKS_APP_PORT") is not None
 
 
-def set_obo_user_token(token: str) -> None:
+def set_obo_user_token(token: str, host: str = "") -> None:
     """Set the user's OBO token for the current request context.
 
     Call this from middleware/dependencies with the user's Authorization
@@ -43,8 +43,11 @@ def set_obo_user_token(token: str) -> None:
     We must explicitly set ``auth_type="pat"`` because the Databricks Apps
     environment has DATABRICKS_CLIENT_ID / DATABRICKS_CLIENT_SECRET set,
     and the SDK would otherwise use oauth-m2m instead of the user's token.
+
+    ``host`` may be provided by the setup wizard via the ``x-databricks-host``
+    request header; it takes precedence over the ``DATABRICKS_HOST`` env var.
     """
-    host = os.environ.get("DATABRICKS_HOST", "")
+    host = host or os.environ.get("DATABRICKS_HOST", "")
     if not host:
         default = _get_default_client()
         host = default.config.host or ""
@@ -143,12 +146,25 @@ def require_obo_workspace_client() -> WorkspaceClient:
 def get_service_principal_client() -> WorkspaceClient:
     """Get the service principal client (bypasses OBO).
 
-    Used for:
-    - App-level operations (Lakebase persistence, background tasks)
-    - Fallback when OBO token lacks required scopes (e.g., Genie API
-      requires 'genie' scope which user authorization may not provide
-      until the consent flow is triggered)
+    On Databricks Apps, uses the app SP credentials (DATABRICKS_CLIENT_ID /
+    DATABRICKS_CLIENT_SECRET injected by the platform).
+
+    Locally without env-var credentials (e.g. setup-wizard-only auth), falls
+    back to the current request's OBO client so the user's OAuth token is used
+    for all calls — no hardcoded PAT needed.
     """
+    # Check whether env-var credentials are actually present before trying the
+    # default client.  When running with the setup wizard and no .env.local
+    # token, the SDK raises "cannot configure default credentials" on first use.
+    has_env_creds = bool(
+        os.environ.get("DATABRICKS_TOKEN")
+        or os.environ.get("DATABRICKS_CLIENT_SECRET")
+        or os.environ.get("DATABRICKS_CLIENT_ID")
+    )
+    if not has_env_creds:
+        obo = _obo_client.get()
+        if obo is not None:
+            return obo
     return _get_default_client()
 
 

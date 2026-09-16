@@ -2,6 +2,50 @@
  * TypeScript types matching the Python Pydantic models in backend/models.py
  */
 
+// Load test types
+export interface LoadTestResult {
+  request_id: number
+  question: string
+  status: "success" | "error" | "timeout" | "rate_limited"
+  latency_ms: number
+  ttfr_ms: number | null
+  detail?: string | null
+}
+
+export interface LoadTestSummary {
+  total: number
+  success: number
+  error: number
+  timeout: number
+  rate_limited: number
+  avg_ms: number
+  p50_ms: number
+  p95_ms: number
+  p99_ms: number
+  min_ms: number
+  max_ms: number
+}
+
+// Per-wave summary in a stepped ramp (one entry per concurrency level).
+export interface LoadTestStepSummary extends LoadTestSummary {
+  step_index: number
+  concurrent_users: number
+}
+
+// Which optimization run/iteration config is CURRENTLY LIVE in the agent.
+export interface ChampionInfo {
+  verified: boolean
+  live_accuracy: number | null
+  live_run_id: string | null
+  live_iteration: number | null
+  live_fingerprint: string | null
+  best_accuracy: number | null
+  best_run_id: string | null
+  best_iteration: number | null
+  live_is_best: boolean | null
+  updated_at?: string | null
+}
+
 // SQL execution types (used by auto-optimize QuestionDetail)
 export interface SqlExecutionColumn {
   name: string
@@ -68,6 +112,7 @@ export interface ScanResult {
   warnings: string[]             // Advisory findings from warning-severity checks
   warning_next_steps: string[]   // Paired with warnings
   scanned_at: string
+  champion?: ChampionInfo | null // Which config version is live (cross-run champion)
 }
 
 export interface SpaceListItem {

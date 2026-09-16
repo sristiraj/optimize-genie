@@ -2,10 +2,96 @@
  * IQScoreTab - Maturity S-curve + three-column check grid + split recommendations.
  */
 import { useState } from "react"
-import { Zap, RefreshCw, TrendingUp, CheckCircle, AlertCircle, AlertTriangle, ChevronDown, ChevronRight, Check, X, Rocket, Loader2 } from "lucide-react"
+import { Zap, RefreshCw, TrendingUp, CheckCircle, AlertCircle, AlertTriangle, ChevronDown, ChevronRight, Check, X, Rocket, Loader2, GitCommit } from "lucide-react"
 import { MATURITY_COLORS, getOptimizationLabel } from "@/lib/utils"
 import { MaturityCurve } from "@/components/MaturityCurve"
-import type { ScanResult, CheckDetail } from "@/types"
+import { revertAutoOptimizeRun } from "@/lib/api"
+import type { ScanResult, CheckDetail, ChampionInfo } from "@/types"
+
+function pctLabel(v: number | null | undefined) {
+  return v == null ? "—" : `${Math.round(v * 100)}%`
+}
+
+/** Shows which optimization run/iteration config is currently deployed, and lets
+ * the user deploy the best config across runs when it isn't already live. */
+function LiveConfigBanner({ champion, onRefresh }: { champion: ChampionInfo; onRefresh?: () => void }) {
+  const [promoting, setPromoting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const runShort = (id: string | null | undefined) => (id ? id.slice(0, 8) : "—")
+  const notBest = champion.live_is_best === false && champion.best_accuracy != null
+  const canPromote = notBest && !!champion.best_run_id
+
+  const promote = async () => {
+    if (!champion.best_run_id) return
+    const pct = pctLabel(champion.best_accuracy)
+    if (!window.confirm(
+      `Deploy the best config (${pct}, run ${runShort(champion.best_run_id)}) to the live agent?\n\n` +
+      `This re-applies that run's champion configuration to the Genie agent.`
+    )) return
+    setPromoting(true)
+    setError(null)
+    try {
+      await revertAutoOptimizeRun(champion.best_run_id, { configTarget: "champion", benchmarkTarget: "current" })
+      onRefresh?.()
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setError(
+        /active|in progress|409/i.test(msg)
+          ? "Can't promote while an optimization run is active — wait for it to finish."
+          : `Promote failed: ${msg}`
+      )
+    } finally {
+      setPromoting(false)
+    }
+  }
+
+  return (
+    <div className="bg-surface border border-default rounded-xl p-4">
+      <div className="flex items-center gap-2 mb-2">
+        <GitCommit className="w-4 h-4 text-info" />
+        <span className="text-sm font-semibold text-secondary">Live config in the agent</span>
+        {champion.verified ? (
+          <span className="text-[10px] px-2 py-0.5 rounded-full border border-success/30 bg-success/10 text-success">verified</span>
+        ) : (
+          <span className="text-[10px] px-2 py-0.5 rounded-full border border-warning/30 bg-warning/10 text-warning">unverified</span>
+        )}
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+        <div>
+          <div className="text-muted mb-0.5">Currently deployed</div>
+          <div className="text-primary font-mono">
+            {champion.verified
+              ? `run ${runShort(champion.live_run_id)} · iter ${champion.live_iteration} · ${pctLabel(champion.live_accuracy)}`
+              : "not matched to a tracked run (hand-edited outside the optimizer?)"}
+          </div>
+          {champion.live_fingerprint && (
+            <div className="text-muted font-mono mt-0.5">config id: {champion.live_fingerprint}</div>
+          )}
+        </div>
+        <div>
+          <div className="text-muted mb-0.5">Best config across runs</div>
+          <div className={`font-mono ${notBest ? "text-warning" : "text-primary"}`}>
+            run {runShort(champion.best_run_id)} · iter {champion.best_iteration} · {pctLabel(champion.best_accuracy)}
+          </div>
+          {notBest && (
+            <div className="mt-1.5">
+              <div className="text-warning mb-1.5">A better config exists but isn't live.</div>
+              <button
+                onClick={promote}
+                disabled={promoting || !canPromote}
+                className="inline-flex items-center gap-1.5 rounded-md bg-info px-2.5 py-1 text-[11px] font-medium text-white hover:brightness-110 disabled:opacity-50 transition"
+              >
+                {promoting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Rocket className="w-3 h-3" />}
+                {promoting ? "Promoting…" : `Promote ${pctLabel(champion.best_accuracy)} to live`}
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+      {error && <div className="mt-2 text-xs text-danger">{error}</div>}
+    </div>
+  )
+}
 
 interface IQScoreTabProps {
   scanResult: ScanResult | null
@@ -75,6 +161,9 @@ export function IQScoreTab({ scanResult, isLoading, onScan, isScanning, onAction
 
   return (
     <div className="space-y-6">
+      {/* Which serialized config version is live in the agent */}
+      {scanResult.champion && <LiveConfigBanner champion={scanResult.champion} onRefresh={onScan} />}
+
       {/* Maturity Curve */}
       <div className="bg-surface border border-default rounded-xl p-5">
         {/* Score header */}

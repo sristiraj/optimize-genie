@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import mlflow
 
+from genie_space_optimizer.common.delta_helpers import _fqn, _quote_id
 from genie_space_optimizer.common.config import (
     BENCHMARK_WINDOW_MAX,
     BENCHMARK_WINDOW_MIN,
@@ -121,7 +122,7 @@ def check_dim_date_staleness(
     dict with keys ``status`` (``ok``/``stale``/``missing``/``error``),
     ``max_current_year_date``, ``days_behind``, and ``message``.
     """
-    fqn = f"{catalog}.{schema}.{table}"
+    fqn = _fqn(catalog, schema, table)
     try:
         row = spark.sql(
             f"""

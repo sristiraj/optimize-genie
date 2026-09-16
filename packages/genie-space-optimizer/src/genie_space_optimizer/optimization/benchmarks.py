@@ -227,7 +227,7 @@ def load_benchmark_corpus(
                 try:
                     from genie_space_optimizer.common.delta_helpers import _safe_refresh
                     _safe_refresh(spark, _quote_identifier_fqn(table_name))
-                    df = spark.table(table_name)
+                    df = spark.table(_quote_identifier_fqn(table_name))
                     rows = df.collect()
                     benchmarks = [_normalize_benchmark_row(r.asDict(recursive=True)) for r in rows]
                     if rows and "inputs" in (rows[0].asDict()):

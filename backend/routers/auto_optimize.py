@@ -197,7 +197,11 @@ class TriggerRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _is_configured() -> bool:
-    return bool(os.environ.get("GSO_CATALOG")) and bool(os.environ.get("GSO_JOB_ID"))
+    from backend.services.request_config import get_request_config
+    rc = get_request_config()
+    catalog = rc.gso_catalog or os.environ.get("GSO_CATALOG", "")
+    job_id = os.environ.get("GSO_JOB_ID", "")
+    return bool(catalog) and bool(job_id)
 
 
 def _delta_query(sql: str, *, strict: bool = False) -> list[dict]:
@@ -251,9 +255,11 @@ async def _delta_query_async(sql: str, *, strict: bool = False) -> list[dict]:
 
 
 def _delta_table(name: str) -> str:
-    """Return fully-qualified Delta table name for a GSO table."""
+    """Return fully-qualified Delta table name for a GSO table, backtick-quoted."""
     config = _build_gso_config()
-    return f"{config.catalog}.{config.schema_name}.{name}"
+    def _q(s: str) -> str:
+        return f"`{s.replace('`', '``')}`"
+    return f"{_q(config.catalog)}.{_q(config.schema_name)}.{_q(name)}"
 
 
 # Bug #2 regression (April 2026): `_ITER_COLS_V2` requires columns that
@@ -542,12 +548,14 @@ def _resolve_run_knobs(run: dict) -> tuple[float | None, int | None]:
 
 
 def _build_gso_config(llm_model_override: str | None = None) -> IntegrationConfig:
+    from backend.services.request_config import get_request_config
+    rc = get_request_config()
     return IntegrationConfig(
-        catalog=os.environ.get("GSO_CATALOG", ""),
+        catalog=rc.gso_catalog or os.environ.get("GSO_CATALOG", ""),
         schema_name=os.environ.get("GSO_SCHEMA", "genie_space_optimizer"),
-        warehouse_id=os.environ.get("GSO_WAREHOUSE_ID") or os.environ.get("SQL_WAREHOUSE_ID", ""),
+        warehouse_id=rc.warehouse_id or os.environ.get("GSO_WAREHOUSE_ID") or os.environ.get("SQL_WAREHOUSE_ID", ""),
         job_id=int(os.environ["GSO_JOB_ID"]) if os.environ.get("GSO_JOB_ID", "").isdigit() else None,
-        llm_model=llm_model_override or os.environ.get("LLM_MODEL", "databricks-claude-sonnet-4-6"),
+        llm_model=llm_model_override or rc.llm_model or os.environ.get("LLM_MODEL", "databricks-claude-sonnet-4-6"),
     )
 
 
@@ -1415,14 +1423,24 @@ async def trigger(body: TriggerRequest, request: Request):
 
     config = _build_gso_config(llm_model_override=selected_llm_model)
 
+    user_email = request.headers.get("x-forwarded-email") or ""
+    user_name = request.headers.get("x-forwarded-preferred-username") or ""
+    if not user_email and not user_name:
+        try:
+            me = ws.current_user.me()
+            user_email = me.user_name or ""
+            user_name = me.display_name or ""
+        except Exception:
+            pass
+
     try:
         result = trigger_optimization(
             space_id=body.space_id,
             ws=ws,
             sp_ws=sp_ws,
             config=config,
-            user_email=request.headers.get("x-forwarded-email"),
-            user_name=request.headers.get("x-forwarded-preferred-username"),
+            user_email=user_email or None,
+            user_name=user_name or None,
             apply_mode=body.apply_mode,
             levers=body.levers,
             target_accuracy=body.target_accuracy,
@@ -1939,6 +1957,28 @@ async def get_run_status(run_id: RunId):
         raise HTTPException(status_code=404, detail="Run not found")
 
     run_status_str = str(run.get("status", "")).upper()
+
+    # If the run still looks active but the Databricks job has terminated,
+    # reconcile the DB row immediately so the UI stops polling.
+    if run_status_str not in _TERMINAL_RUN_STATUSES and run.get("job_run_id") and _is_configured():
+        try:
+            import pandas as pd
+            from genie_space_optimizer.common.warehouse import wh_reconcile_active_runs
+            config = _build_gso_config()
+            sp_ws = get_service_principal_client()
+            changed = wh_reconcile_active_runs(
+                sp_ws, sp_ws, config.warehouse_id,
+                pd.DataFrame([run]), config.catalog, config.schema_name,
+            )
+            if changed:
+                rows = await _delta_query_async(
+                    f"SELECT * FROM {_delta_table('genie_opt_runs')} WHERE run_id = '{run_id}'"
+                )
+                if rows:
+                    run = rows[0]
+                    run_status_str = str(run.get("status", "")).upper()
+        except Exception as exc:
+            logger.debug("run_status reconcile failed run=%s: %s", run_id, exc)
 
     # Pipeline progress: prefer the Databricks Jobs API (authoritative, fast,
     # and immune to the serverless-Delta-write → SQL-Warehouse-read visibility

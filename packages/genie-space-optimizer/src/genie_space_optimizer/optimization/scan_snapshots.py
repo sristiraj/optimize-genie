@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from genie_space_optimizer.common.config import TABLE_SCAN_SNAPSHOTS
-from genie_space_optimizer.common.delta_helpers import execute_delta_write_with_retry
+from genie_space_optimizer.common.delta_helpers import _fqn, execute_delta_write_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ def _iq_scan_postflight_enabled() -> bool:
 
 def _ensure_scan_snapshot_table(spark: Any, catalog: str, schema: str) -> None:
     """Idempotently create the ``genie_opt_scan_snapshots`` UC Delta table."""
-    fqn = f"{catalog}.{schema}.{TABLE_SCAN_SNAPSHOTS}"
+    fqn = _fqn(catalog, schema, TABLE_SCAN_SNAPSHOTS)
     try:
         spark.sql(f"""
             CREATE TABLE IF NOT EXISTS {fqn} (
@@ -94,7 +94,7 @@ def write_scan_snapshot(
     if not run_id or not space_id:
         raise ValueError("run_id and space_id are required")
 
-    fqn = f"{catalog}.{schema}.{TABLE_SCAN_SNAPSHOTS}"
+    fqn = _fqn(catalog, schema, TABLE_SCAN_SNAPSHOTS)
     _ensure_scan_snapshot_table(spark, catalog, schema)
 
     score = scan_result.get("score")
