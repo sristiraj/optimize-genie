@@ -6,6 +6,7 @@ import { OptimizationConfig } from "@/components/auto-optimize/OptimizationConfi
 import { OptimizationLoadingStepper } from "@/components/auto-optimize/OptimizationLoadingStepper"
 import { RunHistoryTable } from "@/components/auto-optimize/RunHistoryTable"
 import { RunDetailView } from "@/components/auto-optimize/RunDetailView"
+import { RunCompareView } from "@/components/auto-optimize/RunCompareView"
 import { TaskRail } from "@/components/auto-optimize/TaskRail"
 import { AttemptLadder } from "@/components/auto-optimize/AttemptLadder"
 import { AttemptLedger } from "@/components/auto-optimize/AttemptLedger"
@@ -46,7 +47,7 @@ interface AutoOptimizeTabProps {
   onViewIqScore?: () => void
 }
 
-type View = "configure" | "monitoring" | "detail"
+type View = "configure" | "monitoring" | "detail" | "compare"
 
 const TERMINAL_STATUSES = new Set([
   "CONVERGED",
@@ -144,6 +145,7 @@ export function AutoOptimizeTab({
   const [stepperComplete, setStepperComplete] = useState(false)
   const [stepperError, setStepperError] = useState<string | null>(null)
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null)
+  const [compareRunIds, setCompareRunIds] = useState<[string, string] | null>(null)
   const [runStatus, setRunStatus] = useState<GSORunStatus | null>(null)
   const [runDetail, setRunDetail] = useState<GSOPipelineRun | null>(null)
   const [iterations, setIterations] = useState<GSOIterationResult[]>([])
@@ -419,6 +421,10 @@ export function AutoOptimizeTab({
             setSelectedRunId(runId)
             setView("detail")
           }}
+          onCompareRuns={(runIdA, runIdB) => {
+            setCompareRunIds([runIdA, runIdB])
+            setView("compare")
+          }}
         />
       </div>
     )
@@ -677,6 +683,21 @@ export function AutoOptimizeTab({
           onRefreshIqScore={refreshIqScore}
         />
       </div>
+    )
+  }
+
+  // Compare view — side-by-side diff of two selected history runs.
+  if (view === "compare" && compareRunIds) {
+    return (
+      <RunCompareView
+        key={compareRunIds.join(":")}
+        runIdA={compareRunIds[0]}
+        runIdB={compareRunIds[1]}
+        onBack={() => {
+          setCompareRunIds(null)
+          setView("configure")
+        }}
+      />
     )
   }
 

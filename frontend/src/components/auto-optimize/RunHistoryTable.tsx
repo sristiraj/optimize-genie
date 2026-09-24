@@ -49,6 +49,9 @@ interface RunHistoryTableProps {
   spaceId: string
   onSelectRun: (runId: string) => void
   onLiveStateChanged?: (runId: string) => Promise<boolean>
+  /** When provided, enables row-selection checkboxes + a "Compare" action
+   * that fires once exactly two runs are selected. */
+  onCompareRuns?: (runIdA: string, runIdB: string) => void
 }
 
 const STATUS_VARIANT: Record<string, "default" | "success" | "warning" | "danger" | "info" | "secondary"> = {
@@ -71,11 +74,20 @@ const HISTORY_ACTION_BUTTON_CLASS =
 // Revert is a live-space mutation — only offer it on runs that are no longer
 // mutating the space. Reverting to a still-running run's snapshot would race
 // the active pipeline (and the backend refuses it with a 409 anyway).
-export function RunHistoryTable({ spaceId, onSelectRun, onLiveStateChanged }: RunHistoryTableProps) {
+export function RunHistoryTable({ spaceId, onSelectRun, onLiveStateChanged, onCompareRuns }: RunHistoryTableProps) {
   const [runs, setRuns] = useState<GSORunSummary[]>([])
   const [loading, setLoading] = useState(true)
   const [currentVersion, setCurrentVersion] = useState<CurrentVersionResponse | null>(null)
+  const [selectedForCompare, setSelectedForCompare] = useState<string[]>([])
   const hasActiveRun = hasActiveOptimizationRun(runs)
+
+  function toggleCompareSelection(runId: string) {
+    setSelectedForCompare((prev) => {
+      if (prev.includes(runId)) return prev.filter((id) => id !== runId)
+      if (prev.length >= 2) return [prev[1], runId]
+      return [...prev, runId]
+    })
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -150,8 +162,24 @@ export function RunHistoryTable({ spaceId, onSelectRun, onLiveStateChanged }: Ru
 
   return (
     <Card>
-      <CardHeader>
+      <CardHeader className="flex flex-row items-center justify-between gap-3">
         <CardTitle>Optimization History</CardTitle>
+        {onCompareRuns && (
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-muted">
+              {selectedForCompare.length === 0
+                ? "Select two runs to compare"
+                : `${selectedForCompare.length}/2 selected`}
+            </span>
+            <button
+              disabled={selectedForCompare.length !== 2}
+              onClick={() => onCompareRuns(selectedForCompare[0], selectedForCompare[1])}
+              className="rounded-md border border-default px-2.5 py-1.5 text-xs font-medium text-primary transition-colors hover:bg-elevated disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Compare Selected
+            </button>
+          </div>
+        )}
       </CardHeader>
       <CardContent>
         {loading ? (
@@ -180,6 +208,7 @@ export function RunHistoryTable({ spaceId, onSelectRun, onLiveStateChanged }: Ru
           <Table>
             <TableHeader>
               <TableRow>
+                {onCompareRuns && <TableHead className="w-8" />}
                 <TableHead>Run</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Outcome</TableHead>
@@ -191,6 +220,16 @@ export function RunHistoryTable({ spaceId, onSelectRun, onLiveStateChanged }: Ru
             <TableBody>
               {runs.map((run) => (
                 <TableRow key={run.run_id}>
+                  {onCompareRuns && (
+                    <TableCell className="align-top">
+                      <input
+                        type="checkbox"
+                        checked={selectedForCompare.includes(run.run_id)}
+                        onChange={() => toggleCompareSelection(run.run_id)}
+                        className="mt-1 h-3.5 w-3.5 rounded border-default"
+                      />
+                    </TableCell>
+                  )}
                   <TableCell className="align-top">
                     <RunMetadataCell run={run} />
                   </TableCell>
